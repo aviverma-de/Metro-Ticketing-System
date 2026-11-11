@@ -108,16 +108,19 @@ It then checks, in this order:
 
 1. **Time:** how long has the passenger been inside? If it is more than the time limit, the result is **over-time**.
 2. **Destination:** is the exit station the destination? If yes, **normal exit**.
-3. **Fare:** compare the forward distance (and fare) from the source to the exit station with what was paid. Less means **early exit**, more means **over-travel**.
+3. **Fare:** work out the fare from the source to the exit station (using the forward distance and the fare slabs) and compare it with the fare already paid. If it is **more**, the result is **over-travel**. If it is the **same or less**, the result is an **early exit**, and nothing is owed.
 
 Example: ticket from station 0 to station 3 (3 stops, ₹20 paid).
 
 | Passenger exits at | Forward distance from 0 | Result |
 |---|---|---|
 | 2 | 2 (₹10, less than ₹20) | Early exit |
+| 4 | 4 (₹20, same fare as paid) | Early exit, nothing owed |
 | 3 | 3 (the destination) | Normal exit |
 | 6 | 6 (₹30, more than ₹20) | Over-travel, excess ₹10 |
 | 0, after a full loop | time inside is about 20 minutes | Over-time |
+
+Note on exit at station 4: it is one stop beyond the destination, but it falls in the same fare slab (3 to 5 stops, ₹20), so the passenger has not travelled further than the fare covers. The gate compares **fares**, not raw distances, which is why no excess is charged.
 
 Example with wrap-around: ticket from station 6 to station 1 is 3 stops (₹20). Exiting at station 7 is 1 stop, which is an early exit. Exiting at station 1 is the destination.
 
@@ -241,8 +244,10 @@ Example: a ticket from 0 to 3 costs ₹20. Inserting ₹10 gives `pay_fail`, and
 **Regular expression of accepted sequences**
 
 ```
-src (src | dst)* dst confirm pay_fail* pay_ok gen
+src (src | dst)* dst confirm confirm pay_fail* pay_ok gen
 ```
+
+`confirm` appears twice because the kiosk has two confirm steps: the first shows the fare (q2 → q3) and the second proceeds to payment (q3 → q4).
 
 ### 10.3 Journey DFA (the core of the project)
 
@@ -265,8 +270,8 @@ Models the life of one ticket from issue to exit.
 |---|---|
 | E | Valid entry scan at the source station |
 | D | Exit at the destination |
-| X | Early exit (distance to exit station is less than the distance paid for) |
-| O | Over-travel (distance to exit station is more than the distance paid for) |
+| X | Early exit (fare to the exit station is the same as or less than the fare paid, and it is not the destination) |
+| O | Over-travel (fare to the exit station is more than the fare paid) |
 | T | Over-time (time inside is more than the time limit) |
 | P | Excess or over-time charge paid |
 | W | Wrong use: forged token, wrong entry station, double entry, or exit without entry |
@@ -353,7 +358,7 @@ Both machines describe the same gate behaviour in two different styles.
 
 ## 11. The classifier rules
 
-For every scan, the classifier produces one symbol. `dist(a, b)` means `(b - a) mod 8`. `time_inside` is the exit time minus the recorded entry time.
+For every scan, the classifier produces one symbol. `dist(a, b)` means `(b - a) mod 8`. `exit_fare` is the fare for `dist(source, exit station)`, and `paid_fare` is the fare on the ticket. `time_inside` is the exit time minus the recorded entry time.
 
 **Entry gate**
 - Signature invalid → `W`
@@ -367,8 +372,8 @@ For every scan, the classifier produces one symbol. `dist(a, b)` means `(b - a) 
 - Ticket not marked inside → `W`
 - `time_inside` greater than the limit (19 minutes) → `T`
 - Exit station is the destination → `D`
-- `dist(source, exit station)` less than `dist(source, destination)` → `X`
-- Otherwise → `O`
+- `exit_fare` greater than `paid_fare` → `O`
+- Otherwise (same or lower fare) → `X`
 
 When the passenger pays the excess or over-time charge, the system feeds `P` into the Journey DFA.
 
@@ -409,7 +414,7 @@ If the user changes the source or destination after choosing, that simply feeds 
 **Example:** a ticket from 0 to 3 costs ₹20. The user inserts ₹10, the screen says "₹10 more needed" and the state stays at q4. The user inserts another ₹10, the total reaches ₹20, the state moves to q5, and Generate Ticket becomes available.
 
 **Why it matters**
-The highlighted state makes the DFA visible. A viewer can watch "not enough cash, still at q4" and "paid, now at q5" as they happen, and the accepted sequence matches the regex `src (src | dst)* dst confirm pay_fail* pay_ok gen`.
+The highlighted state makes the DFA visible. A viewer can watch "not enough cash, still at q4" and "paid, now at q5" as they happen, and the accepted sequence matches the regex `src (src | dst)* dst confirm confirm pay_fail* pay_ok gen`.
 
 ---
 
@@ -540,6 +545,7 @@ The kiosk **creates** a ticket, and the gate simulator **uses** that ticket, so 
 | 0 | 20 | T (full loop) |
 | 3 | 25 | T (too long, even at the destination) |
 | 0 | 1 | X (entered and left at once) |
+| 4 | 10 | X (same fare slab as the destination, nothing owed) |
 
 Ticket from 6 to 1 (wrap-around): exit at 1 after 8 minutes gives `D`, exit at 7 after 3 minutes gives `X`.
 
