@@ -1,476 +1,802 @@
 """
-app.py - Streamlit UI for the Automata-Based Smart Metro Ticketing System
-==========================================================================
-Person 3: UI, integration and report.
+Streamlit User Interface — Metro Ticketing & Journey Validation System
+-----------------------------------------------------------------------
+Person 3 Frontend: Connects Person 1's automata engines and Person 2's
+gate and ticketing logic to an interactive dashboard.
 
-Run with:   streamlit run app.py
-
-Four screens (chosen from the sidebar):
-  1. Kiosk            - books a ticket using the Booking DFA
-  2. Gate simulator   - scans tickets using Person 2's process_scan / pay_excess
-  3. String tester    - runs any symbol string through a DFA and shows the trace
-  4. Automata viewer  - tables, regexes, Moore/Mealy, NFA->DFA, minimization
-
-This file contains NO automata logic of its own. Every state change comes
-from Person 1's DFAs; every scan decision comes from Person 2's classifier.
+Rule Zero: The UI has NO logic. All fare, payment, token, classifier,
+DFA and time rules live strictly in the backend modules.
 """
 
-import re
-
 import streamlit as st
-
-import booking
 import config
-import journey_automata as ja
-from journey import get_ticket_status, pay_excess, process_scan
-from stations import STATION_NAMES, check_payment, fare
-from token_utils import create_token, make_qr_image
-
-st.set_page_config(page_title="Metro Ticketing - Automata", page_icon="🚇", layout="wide")
-
-BOOKING_DFA = booking.BOOKING_DFA
-
+import stations
+import token_utils
+import record
+import journey
+from booking import (
+    BOOKING_DFA,
+    BOOKING_REGEX_AS_WRITTEN,
+    BOOKING_REGEX_CORRECTED,
+    check_booking_regex,
+    get_transition_table as get_booking_transition_table,
+    get_subset_steps,
+    get_minimization_steps,
+)
+from journey_automata import (
+    JOURNEY_DFA,
+    JOURNEY_REGEX,
+    check_journey_regex,
+    get_transition_table as get_journey_transition_table,
+    get_moore_table,
+    get_mealy_table,
+)
+import ui_helpers
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# Page Configuration
 # ---------------------------------------------------------------------------
-def station_label(i: int) -> str:
-    return f"{i} - {STATION_NAMES[i]}"
+st.set_page_config(
+    page_title="Metro Automata System",
+    page_icon="🚇",
+    layout="wide",
+)
 
+# Initialize database on startup
+record.init_db()
 
-def init_kiosk_state() -> None:
-    """Create the kiosk's session variables (Streamlit re-runs the script on every click)."""
+# ---------------------------------------------------------------------------
+# Session State Initialization (must run before any widget)
+# ---------------------------------------------------------------------------
+def _init():
     defaults = {
-        "bk_state": BOOKING_DFA.start_state,
-        "bk_symbols": [],
-        "bk_src": None,
-        "bk_dst": None,
-        "bk_inserted": 0,
-        "bk_fare": None,
-        "bk_change": 0,
-        "bk_token": None,
-        "bk_msg": "",
+        # Kiosk
+        "booking_state": BOOKING_DFA.start_state,
+        "booking_history": [],
+        "selected_source": None,
+        "selected_dest": None,
+        "fare_amount": 0,
+        "inserted_total": 0,
+        "change_amount": 0,
+        "token": None,
+        "qr_image": None,
+        # Gate
+        "gate_token": "",
+        "last_scan": None,
+        "scan_log": [],
+        # String tester
+        "tester_sequence": "EOP",
+        "tester_dfa_kind": "Journey DFA",
     }
-    for key, value in defaults.items():
-        st.session_state.setdefault(key, value)
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-
-def reset_kiosk() -> None:
-    for key in [k for k in st.session_state if k.startswith("bk_")]:
-        del st.session_state[key]
-    init_kiosk_state()
-
-
-def bk_feed(symbol: str) -> None:
-    """Feed ONE symbol into the Booking DFA and remember it."""
-    st.session_state.bk_state = BOOKING_DFA.step(st.session_state.bk_state, symbol)
-    st.session_state.bk_symbols.append(symbol)
-
-
-def dot_diagram(edges, start, accepting, highlight=None, dead=None, rankdir="LR") -> str:
-    """
-    Build a Graphviz DOT string.
-    edges: list of (from_state, label, to_state).  Parallel edges are merged.
-    Edges that go into the dead/trap state are left out to keep the picture
-    readable (every missing edge goes to the dead state).
-    """
-    merged = {}
-    for a, label, b in edges:
-        if dead is not None and b == dead and a != dead:
-            continue
-        if dead is not None and a == dead:
-            continue
-        merged.setdefault((a, b), []).append(label)
-
-    nodes = []
-    for a, b in merged:
-        for n in (a, b):
-            if n not in nodes:
-                nodes.append(n)
-    if start not in nodes:
-        nodes.append(start)
-    if dead is not None and dead not in nodes:
-        nodes.append(dead)
-
-    lines = [f"digraph G {{ rankdir={rankdir}; node [fontname=Helvetica]; edge [fontname=Helvetica, fontsize=10];"]
-    lines.append('__start [shape=point, width=0.15];')
-    lines.append(f'__start -> "{start}";')
-    for n in nodes:
-        shape = "doublecircle" if n in accepting else "circle"
-        attrs = f'shape={shape}'
-        if n == highlight:
-            attrs += ', style=filled, fillcolor="#ffd54f", penwidth=3'
-        elif n == dead:
-            attrs += ', style=dashed, color=gray, fontcolor=gray'
-        lines.append(f'"{n}" [{attrs}];')
-    for (a, b), labels in merged.items():
-        lines.append(f'"{a}" -> "{b}" [label="{", ".join(labels)}"];')
-    lines.append("}")
-    return "\n".join(lines)
-
-
-def dfa_edges(dfa):
-    return [(s, sym, t) for (s, sym), t in dfa.transitions.items()]
-
-
-def nfa_edges(nfa):
-    edges = []
-    for (s, sym), targets in nfa.transitions.items():
-        label = sym if sym != nfa.epsilon_symbol else "ε"
-        for t in sorted(targets):
-            edges.append((s, label, t))
-    return edges
-
-
-def parse_symbols(text: str, dfa_name: str):
-    """Turn what the user typed into a list of symbols."""
-    text = text.strip()
-    if dfa_name == "Journey DFA":
-        return [c for c in text.upper() if not c.isspace() and c != ","]
-    return [tok for tok in re.split(r"[\s,]+", text) if tok]
-
-
-def show_trace(accepted: bool, trace) -> None:
-    if accepted:
-        st.success("ACCEPTED")
-    else:
-        st.error("REJECTED")
-    st.write(f"**Reason:** {trace.reason}")
-    st.write(f"**Final state:** `{trace.final_state}`")
-    if len(trace) > 0:
-        st.table(list(trace))
-    else:
-        st.info("Empty input: no steps taken. The DFA stays in its start state.")
-
+_init()
 
 # ---------------------------------------------------------------------------
-# Screen 1: Kiosk
+# Sidebar
 # ---------------------------------------------------------------------------
-def screen_kiosk() -> None:
-    init_kiosk_state()
-    ss = st.session_state
-    state = ss.bk_state
-
-    st.header("🎫 Kiosk - book a ticket")
-    st.caption("Every click below is one input symbol for the Booking DFA. "
-               "The passenger never chooses the payment result: the system decides pay_ok or pay_fail.")
-
-    left, right = st.columns([3, 2])
-
-    with left:
-        # --- Stations ---
-        c1, c2 = st.columns(2)
-        src_choice = c1.selectbox("Source station", range(config.NUM_STATIONS),
-                                  format_func=station_label, key="bk_src_choice")
-        dst_choice = c2.selectbox("Destination station", range(config.NUM_STATIONS),
-                                  index=3, format_func=station_label, key="bk_dst_choice")
-        can_pick = state in ("q0", "q1", "q2")
-        b1, b2 = st.columns(2)
-        if b1.button("Set source  (src)", disabled=not can_pick):
-            ss.bk_src = src_choice
-            bk_feed("src")
-            st.rerun()
-        if b2.button("Set destination  (dst)", disabled=not (can_pick and state != "q0")):
-            if ss.bk_src is None or dst_choice == ss.bk_src:
-                ss.bk_msg = "Source and destination cannot be the same station."
-            else:
-                ss.bk_dst = dst_choice
-                bk_feed("dst")
-                ss.bk_msg = ""
-            st.rerun()
-
-        if ss.bk_msg:
-            st.warning(ss.bk_msg)
-
-        # --- Show fare / proceed ---
-        st.divider()
-        b3, b4 = st.columns(2)
-        if b3.button("Show Fare  (confirm)", disabled=(state != "q2")):
-            ss.bk_fare = fare(ss.bk_src, ss.bk_dst)
-            bk_feed("confirm")
-            st.rerun()
-        if ss.bk_fare is not None:
-            st.metric("Fare", f"₹{ss.bk_fare}")
-        if b4.button("Proceed to Pay  (confirm)", disabled=(state != "q3")):
-            bk_feed("confirm")
-            st.rerun()
-
-        # --- Cash ---
-        st.divider()
-        st.subheader("Insert cash")
-        st.write(f"Inserted so far: **₹{ss.bk_inserted}**")
-        cash_cols = st.columns(4)
-        paying = (state == "q4")
-        amount_to_add = 0
-        for col, amt in zip(cash_cols[:3], (10, 20, 50)):
-            if col.button(f"₹{amt}", disabled=not paying, key=f"cash_{amt}"):
-                amount_to_add = amt
-        if amount_to_add:
-            ss.bk_inserted += amount_to_add
-            symbol, change = check_payment(ss.bk_inserted, ss.bk_fare)
-            bk_feed(symbol)
-            ss.bk_change = change
-            st.rerun()
-
-        if state == "q4":
-            st.info(f"₹{ss.bk_fare - ss.bk_inserted} more needed.")
-        if state in ("q5", "q6"):
-            st.success(f"Payment complete. Change to return: ₹{ss.bk_change}")
-
-        # --- Generate / cancel ---
-        st.divider()
-        b5, b6 = st.columns(2)
-        if b5.button("Generate Ticket  (gen)", disabled=(state != "q5")):
-            bk_feed("gen")
-            ss.bk_token = create_token(ss.bk_src, ss.bk_dst)
-            st.rerun()
-        if b6.button("Cancel  (cancel)", disabled=(state in ("q6", "qd"))):
-            bk_feed("cancel")
-            # cancel returns the DFA to q0: forget everything about this booking
-            ss.bk_src = ss.bk_dst = ss.bk_fare = None
-            ss.bk_inserted = 0
-            ss.bk_change = 0
-            ss.bk_msg = ""
-            st.rerun()
-
-        if state == "q6" and ss.bk_token:
-            st.success("Ticket generated!")
-            st.code(ss.bk_token, language=None)
-            st.caption("Copy this token into the Gate simulator.")
-            qr = make_qr_image(ss.bk_token)
-            if qr is not None:
-                st.image(qr.get_image() if hasattr(qr, "get_image") else qr, width=200)
-
-        if state in ("q6", "qd"):
-            if st.button("Start a new booking"):
-                reset_kiosk()
-                st.rerun()
-
-    with right:
-        st.subheader("Booking DFA")
-        st.markdown(f"Current state: **`{state}`**"
-                    + ("  ✅ accepting" if BOOKING_DFA.is_accepting(state) else ""))
-        st.graphviz_chart(dot_diagram(dfa_edges(BOOKING_DFA), BOOKING_DFA.start_state,
-                                      BOOKING_DFA.final_states, highlight=state,
-                                      dead=BOOKING_DFA.dead_state))
-        st.caption("Edges into the dead state qd are hidden: every action not shown leads to qd.")
-        st.write("**Symbols fed so far:**")
-        st.code(" ".join(ss.bk_symbols) if ss.bk_symbols else "(none yet)", language=None)
-        if ss.bk_symbols:
-            ok, tr = booking.run(ss.bk_symbols)
-            st.write(f"Verdict for this sequence: **{'ACCEPTED' if ok else 'not accepted (yet)'}** - {tr.reason}")
-
-
-# ---------------------------------------------------------------------------
-# Screen 2: Gate simulator
-# ---------------------------------------------------------------------------
-def show_gate_result(res: dict) -> None:
-    if res["gate"] == "OPEN":
-        st.success("🟢 GATE OPEN")
-    else:
-        st.error("🔴 GATE LOCKED")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Symbol", res["symbol"] if res["symbol"] else "-")
-    c2.metric("State change", f"{res['old_state']} → {res['new_state']}")
-    c3.metric("Amount", f"₹{res['amount']}")
-    st.write(f"**Message:** {res['message']}")
-    st.write(f"**Moore output** (what the new state says): {res['moore_output']}")
-    st.write(f"**Mealy output** (what the transition says): {res['mealy_output']}")
-
-
-def screen_gate() -> None:
-    st.header("🚪 Gate simulator")
-    st.caption("Scan runs Person 2's process_scan: classifier → Journey DFA → record. "
-               "Time is a simulated clock, so a 20-minute loop takes two seconds.")
-
-    default_token = st.session_state.get("bk_token") or ""
-    token = st.text_area("Token (paste here, stand-in for a camera)", value=default_token, height=70).strip()
-
-    c1, c2, c3 = st.columns(3)
-    station = c1.selectbox("Gate is at station", range(config.NUM_STATIONS), format_func=station_label)
-    gate_type = c2.radio("Gate type", ["entry", "exit"], horizontal=True)
-    minutes = c3.number_input("Minutes since entry (exit gates)", min_value=0.0, value=8.0, step=0.5)
-
-    b1, b2 = st.columns([1, 1])
-    if b1.button("Scan", type="primary", disabled=not token):
-        status = get_ticket_status(token)
-        if gate_type == "entry":
-            now = 0.0
-        elif status and status.get("entry_time") is not None:
-            # process_scan wants an absolute clock: entry_time + minutes inside
-            now = status["entry_time"] + minutes
-        else:
-            now = float(minutes)
-        st.session_state.gate_result = process_scan(token, station, gate_type, now)
-    res = st.session_state.get("gate_result")
-
-    if res and res["new_state"] == "JE":
-        if b2.button(f"Pay ₹{res['amount']}"):
-            st.session_state.gate_result = pay_excess(token)
-            res = st.session_state.gate_result
+with st.sidebar:
+    st.header("⚙️ Simulation Settings")
+    st.write(f"**Total Stations:** {config.NUM_STATIONS}")
+    st.write(f"**Travel Time:** {config.MINUTES_PER_STATION} min/station")
+    st.write(f"**Buffer:** {config.BUFFER_MINUTES} min")
+    st.write(f"**Time Limit:** {config.TIME_LIMIT} min")
+    st.write(f"**Overtime Charge:** Rs {config.OVERTIME_CHARGE}")
+    st.write(f"**DB:** `{config.DB_PATH}`")
 
     st.divider()
-    if res:
-        show_gate_result(res)
+    st.subheader("DB Management")
 
-    status = get_ticket_status(token) if token else None
-    if status:
-        st.subheader("Ticket status")
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("State", status["state"])
-        d2.metric("Route", f"{status['source']} → {status['dest']}")
-        d3.metric("Paid fare", f"₹{status['paid_fare']}")
-        d4.metric("Pending", f"₹{status['pending_amount']}")
-        history = " ".join(status["history"]) if status["history"] else "(none)"
-        st.write("**History line** (copy into the String tester):")
-        st.code(history, language=None)
-    elif token:
-        st.warning("This token is not in the record (edited or unknown).")
+    def _do_reset():
+        if st.session_state.get("confirm_reset_chk"):
+            record.reset_db()
+            st.session_state.update({
+                "booking_state": BOOKING_DFA.start_state,
+                "booking_history": [],
+                "selected_source": None,
+                "selected_dest": None,
+                "fare_amount": 0,
+                "inserted_total": 0,
+                "change_amount": 0,
+                "token": None,
+                "qr_image": None,
+                "gate_token": "",
+                "last_scan": None,
+                "scan_log": [],
+            })
 
+    st.checkbox("Confirm reset", key="confirm_reset_chk")
+    st.button("Reset demo database", on_click=_do_reset)
+    if st.session_state.get("confirm_reset_chk") is False:
+        # Only show warning after the button was pressed without confirm—handled silently.
+        pass
 
 # ---------------------------------------------------------------------------
-# Screen 3: String tester
+# Kiosk Callbacks  (each feeds exactly ONE symbol to BOOKING_DFA)
 # ---------------------------------------------------------------------------
-def screen_tester() -> None:
-    st.header("🔤 String tester (pure automata mode)")
-    which = st.radio("Automaton", ["Journey DFA", "Booking DFA"], horizontal=True)
 
-    if which == "Journey DFA":
-        st.caption("Type symbols from E D X O T P W R, e.g. `EOP`.")
-        default = "EOP"
-        dfa, regex = ja.JOURNEY_DFA, ja.JOURNEY_REGEX
+def _kiosk_step(symbol: str):
+    curr = st.session_state["booking_state"]
+    st.session_state["booking_state"] = BOOKING_DFA.step(curr, symbol)
+    st.session_state["booking_history"].append(symbol)
+
+
+def on_source_changed():
+    val = st.session_state.get("kiosk_src_select", "")
+    if val and val != "Select source":
+        st.session_state["selected_source"] = int(val.split(" - ")[0])
+        st.session_state["selected_dest"] = None
+        _kiosk_step("src")
+
+
+def on_dest_changed():
+    val = st.session_state.get("kiosk_dst_select", "")
+    if val and val != "Select destination":
+        st.session_state["selected_dest"] = int(val.split(" - ")[0])
+        _kiosk_step("dst")
+
+
+def on_show_fare():
+    src = st.session_state["selected_source"]
+    dst = st.session_state["selected_dest"]
+    try:
+        st.session_state["fare_amount"] = stations.fare(src, dst)
+        _kiosk_step("confirm")
+    except Exception as exc:
+        st.session_state["_kiosk_error"] = str(exc)
+
+
+def on_proceed_pay():
+    st.session_state["inserted_total"] = 0
+    st.session_state["change_amount"] = 0
+    _kiosk_step("confirm")
+
+
+def on_cash_inserted(amt: int):
+    st.session_state["inserted_total"] += amt
+    sym, change = stations.check_payment(
+        st.session_state["inserted_total"],
+        st.session_state["fare_amount"],
+    )
+    st.session_state["change_amount"] = change
+    _kiosk_step(sym)
+
+
+def on_generate_ticket():
+    _kiosk_step("gen")
+    tok = token_utils.create_token(
+        st.session_state["selected_source"],
+        st.session_state["selected_dest"],
+    )
+    st.session_state["token"] = tok
+    st.session_state["qr_image"] = token_utils.make_qr_image(tok)
+
+
+def on_cancel():
+    _kiosk_step("cancel")
+    st.session_state["selected_source"] = None
+    st.session_state["selected_dest"] = None
+    st.session_state["fare_amount"] = 0
+    st.session_state["inserted_total"] = 0
+    st.session_state["change_amount"] = 0
+
+
+def on_new_booking():
+    st.session_state.update({
+        "booking_state": BOOKING_DFA.start_state,
+        "booking_history": [],
+        "selected_source": None,
+        "selected_dest": None,
+        "fare_amount": 0,
+        "inserted_total": 0,
+        "change_amount": 0,
+        "token": None,
+        "qr_image": None,
+    })
+
+
+def on_send_to_gate():
+    tok = st.session_state.get("token")
+
+    if tok:
+        st.session_state["gate_token"] = tok
+        st.session_state["sent_to_gate"] = True
     else:
-        st.caption("Type symbols separated by spaces: src dst confirm pay_ok pay_fail gen cancel.")
-        default = "src dst confirm confirm pay_fail pay_ok gen"
-        dfa, regex = booking.BOOKING_DFA, booking.BOOKING_REGEX_CORRECTED
+        st.session_state["sent_to_gate"] = False
 
-    text = st.text_input("Sequence", value=default, key=f"seq_{which}")
+
+# ---------------------------------------------------------------------------
+# Gate callbacks
+# ---------------------------------------------------------------------------
+
+def on_scan_gate():
+    tok = st.session_state.get("gate_token", "")
+    station_idx = st.session_state.get("gate_station_select", 0)
+    gtype = st.session_state.get("gate_type_radio", "entry")
+    mins = st.session_state.get("gate_minutes", 0.0)
+    try:
+        status = journey.get_ticket_status(tok)
+        now = ui_helpers.compute_now(gtype, mins, status)
+        res = journey.process_scan(tok, station_idx, gtype, now)
+        st.session_state["last_scan"] = res
+        st.session_state["scan_log"].insert(0, {
+            "station": station_idx,
+            "gate": gtype,
+            "symbol": res["symbol"],
+            "old_state": res["old_state"],
+            "new_state": res["new_state"],
+            "gate_result": res["gate"],
+            "amount": res["amount"],
+        })
+    except Exception as exc:
+        st.session_state["gate_error"] = str(exc)
+
+
+def on_pay_excess():
+    tok = st.session_state.get("gate_token", "")
+    station_idx = st.session_state.get("gate_station_select", 0)
+    gtype = st.session_state.get("gate_type_radio", "exit")
+    try:
+        p_res = journey.pay_excess(tok)
+        st.session_state["last_scan"] = p_res
+        st.session_state["scan_log"].insert(0, {
+            "station": station_idx,
+            "gate": gtype,
+            "symbol": p_res["symbol"],
+            "old_state": p_res["old_state"],
+            "new_state": p_res["new_state"],
+            "gate_result": p_res["gate"],
+            "amount": p_res["amount"],
+        })
+    except Exception as exc:
+        st.session_state["gate_error"] = str(exc)
+
+
+def on_use_last_ticket():
+    if st.session_state.get("token"):
+        st.session_state["gate_token"] = st.session_state["token"]
+
+
+def on_send_to_tester():
+    tok = st.session_state.get("gate_token", "")
+    t_status = journey.get_ticket_status(tok)
+    if t_status:
+        st.session_state["tester_sequence"] = t_status["history"]
+        st.session_state["tester_dfa_kind"] = "Journey DFA"
+
+
+# String tester example callbacks
+def _set_tester_seq(seq: str, kind: str = "Journey DFA"):
+    st.session_state["tester_sequence"] = seq
+    st.session_state["tester_dfa_kind"] = kind
+
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+tab_kiosk, tab_gate, tab_tester, tab_viewer = st.tabs([
+    "🎟️ Kiosk",
+    "🚪 Gate Simulator",
+    "🔤 String Tester",
+    "🔍 Automata Viewer",
+])
+
+# ===========================================================================
+# TAB 1 — KIOSK
+# ===========================================================================
+with tab_kiosk:
+    col_left, col_right = st.columns([1.1, 1], gap="large")
+
+    with col_left:
+        st.subheader("Interactive Ticket Kiosk")
+
+        # Show any error produced by a callback
+        if "_kiosk_error" in st.session_state:
+            st.error(st.session_state.pop("_kiosk_error"))
+
+        b_state = st.session_state["booking_state"]
+
+        # ---- Source selectbox ----
+        src_opts = ["Select source"] + [
+            f"{i} - {n}" for i, n in enumerate(stations.STATION_NAMES)
+        ]
+        src_idx = 0
+        if st.session_state["selected_source"] is not None:
+            src_idx = st.session_state["selected_source"] + 1
+
+        st.selectbox(
+            "Source Station",
+            options=src_opts,
+            index=src_idx,
+            disabled=b_state not in ("q0", "q1", "q2"),
+            key="kiosk_src_select",
+            on_change=on_source_changed,
+        )
+
+        # ---- Destination selectbox ----
+        dst_opts = ["Select destination"]
+        if st.session_state["selected_source"] is not None:
+            dst_opts += [
+                f"{i} - {n}"
+                for i, n in enumerate(stations.STATION_NAMES)
+                if i != st.session_state["selected_source"]
+            ]
+        dst_idx = 0
+        if st.session_state["selected_dest"] is not None:
+            match = (
+                f"{st.session_state['selected_dest']} - "
+                f"{stations.STATION_NAMES[st.session_state['selected_dest']]}"
+            )
+            if match in dst_opts:
+                dst_idx = dst_opts.index(match)
+
+        st.selectbox(
+            "Destination Station",
+            options=dst_opts,
+            index=dst_idx,
+            disabled=b_state not in ("q1", "q2") or st.session_state["selected_source"] is None,
+            key="kiosk_dst_select",
+            on_change=on_dest_changed,
+        )
+
+        # ---- State-specific controls ----
+        if b_state == "q2":
+            st.button("Show Fare", on_click=on_show_fare, type="primary")
+
+        if b_state == "q3":
+            st.info(f"**Trip Fare:** Rs {st.session_state['fare_amount']}")
+            st.button("Proceed to Pay", on_click=on_proceed_pay, type="primary")
+
+        if b_state == "q4":
+            fare_amt = st.session_state["fare_amount"]
+            ins = st.session_state["inserted_total"]
+            st.write(f"### Cash Payment  (Fare: Rs {fare_amt})")
+            st.write(f"**Inserted so far:** Rs {ins}")
+            remaining = fare_amt - ins
+            if remaining > 0:
+                st.warning(f"**Rs {remaining} more needed**")
+            else:
+                st.success(f"**Change to return: Rs {st.session_state['change_amount']}**")
+
+            c1, c2, c3 = st.columns(3)
+            c1.button("Insert Rs 10", on_click=on_cash_inserted, args=(10,), key="cash_10")
+            c2.button("Insert Rs 20", on_click=on_cash_inserted, args=(20,), key="cash_20")
+            c3.button("Insert Rs 50", on_click=on_cash_inserted, args=(50,), key="cash_50")
+
+            with st.expander("Custom amount"):
+                st.number_input(
+                    "Rs", min_value=1, value=10, step=5,
+                    key="kiosk_custom_cash",
+                )
+                st.button(
+                    "Insert custom",
+                    on_click=lambda: on_cash_inserted(st.session_state["kiosk_custom_cash"]),
+                    key="cash_custom_btn",
+                )
+
+        if b_state == "q5":
+            st.success(f"Payment done!  Change: Rs {st.session_state['change_amount']}")
+            st.button("Generate Ticket", on_click=on_generate_ticket, type="primary")
+
+        if b_state == "q6":
+            tok = st.session_state["token"]
+            st.success("🎉 Ticket generated!")
+            if tok:
+                st.write("**Token (copy with the button):**")
+                st.code(tok, language="text")
+                qr = st.session_state["qr_image"]
+                if qr:
+                    qr_img = qr.get_image()
+                    st.image(qr_img, caption="Scan at the gate", width=180)
+                else:
+                    st.caption("QR unavailable — `qrcode` library not installed.")
+
+                src_id = st.session_state["selected_source"]
+                dst_id = st.session_state["selected_dest"]
+                if src_id is not None and dst_id is not None:
+                    st.write(
+                        f"**Route:** {src_id} {stations.STATION_NAMES[src_id]} → "
+                        f"{dst_id} {stations.STATION_NAMES[dst_id]}  |  "
+                        f"**Fare:** Rs {st.session_state['fare_amount']}"
+                    )
+
+                col_a, col_b = st.columns(2)
+                col_a.button("Send to Gate Simulator", on_click=on_send_to_gate)
+                col_b.button("New booking", on_click=on_new_booking)
+
+        # Cancel is only valid in q0–q4
+        if b_state in ("q0", "q1", "q2", "q3", "q4"):
+            st.write("")
+            st.button("Cancel", on_click=on_cancel, type="secondary")
+
+    # ---- Right column: live DFA panel ----
+    with col_right:
+        st.subheader("Live Booking DFA")
+        b_state = st.session_state["booking_state"]
+        lbl = ui_helpers.STATE_LABELS.get(b_state, b_state)
+        st.markdown(f"#### State: `{b_state}` — {lbl}")
+
+        hist = st.session_state["booking_history"]
+        trace_str = " → ".join(hist) if hist else "(start)"
+        st.caption(f"Trace: `{trace_str}`")
+
+        try:
+            dot = ui_helpers.build_dot(
+                get_booking_transition_table(),
+                current_state=b_state,
+                accepting=BOOKING_DFA.final_states,
+                dead=BOOKING_DFA.dead_state,
+            )
+            st.graphviz_chart(dot)
+        except Exception as exc:
+            st.error(f"Diagram error: {exc}")
+
+        st.caption("All other transitions go to the dead state (`qd`).")
+        st.write("**Formal Regular Expression (corrected):**")
+        st.code(BOOKING_REGEX_CORRECTED, language="text")
+
+# ===========================================================================
+# TAB 2 — GATE SIMULATOR
+# ===========================================================================
+with tab_gate:
+    st.subheader("Metro Gate Simulator")
+    col_in, col_out = st.columns([1, 1.3], gap="large")
+
+    with col_in:
+        st.selectbox(
+            "Station",
+            options=range(config.NUM_STATIONS),
+            format_func=lambda i: f"Station {i} — {stations.STATION_NAMES[i]}",
+            key="gate_station_select",
+        )
+        st.radio(
+            "Gate type",
+            options=["entry", "exit"],
+            horizontal=True,
+            key="gate_type_radio",
+        )
+
+        # Token text area uses the session-state key directly
+        st.text_area("Ticket Token", key="gate_token", height=80)
+        st.button("Use last generated ticket", on_click=on_use_last_ticket)
+
+        # Minutes input (always rendered to keep widget key stable)
+        mins_disabled = st.session_state.get("gate_type_radio", "entry") != "exit"
+        st.number_input(
+            "Minutes since entry",
+            min_value=0.0,
+            max_value=120.0,
+            value=5.0,
+            step=1.0,
+            disabled=mins_disabled,
+            key="gate_minutes",
+            help=(
+                f"{config.MINUTES_PER_STATION} min/station · "
+                f"Time limit: {config.TIME_LIMIT} min · "
+                f"Overtime charge: Rs {config.OVERTIME_CHARGE}"
+            ),
+        )
+
+        st.button("Scan Gate", on_click=on_scan_gate, type="primary")
+
+        if "gate_error" in st.session_state:
+            st.error(st.session_state.pop("gate_error"))
+
+    with col_out:
+        scan_res = st.session_state.get("last_scan")
+        if scan_res:
+            # Gate indicator
+            if scan_res["gate"] == "OPEN":
+                st.success("## 🟢  GATE OPEN")
+            else:
+                st.error("## 🔴  GATE LOCKED")
+
+            if not scan_res.get("valid", True):
+                st.error("❌ **Invalid or forged token**")
+
+            sym = scan_res["symbol"]
+            old_s = scan_res["old_state"]
+            new_s = scan_res["new_state"]
+            st.write(
+                f"**Symbol:** `{sym}` — {ui_helpers.SYMBOL_MEANINGS.get(sym, sym)}"
+            )
+            st.write(
+                f"**DFA:** `{old_s}` ({ui_helpers.STATE_LABELS.get(old_s or '', old_s or 'None')}) "
+                f"➔ `{new_s}` ({ui_helpers.STATE_LABELS.get(new_s, new_s)})"
+            )
+            st.info(scan_res["message"])
+
+            c_mo, c_me = st.columns(2)
+            c_mo.markdown(
+                "<div style='background:#e8f4f8;color:#17202a;padding:10px;border-radius:5px;"
+                "border-left:4px solid #0288d1'>"
+                f"<b>Moore:</b><br>{scan_res['moore_output']}</div>",
+                unsafe_allow_html=True,
+            )
+
+            c_me.markdown(
+                "<div style='background:#f3e5f5;color:#17202a;padding:10px;border-radius:5px;"
+                "border-left:4px solid #7b1fa2'>"
+                f"<b>Mealy:</b><br>{scan_res['mealy_output']}</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Pay button when JE
+            if scan_res.get("new_state") == "JE":
+                amount = scan_res.get("amount", 0)
+                # Also read from pending_amount in case the scan was a re-scan
+                tok_tmp = st.session_state.get("gate_token", "")
+                if tok_tmp:
+                    try:
+                        ts = journey.get_ticket_status(tok_tmp)
+                        if ts and ts.get("pending_amount"):
+                            amount = ts["pending_amount"]
+                    except Exception:
+                        pass
+                st.warning(f"⚠️ Pending charge: **Rs {amount}**")
+                st.button(
+                    f"Pay Rs {amount}",
+                    on_click=on_pay_excess,
+                    type="primary",
+                    key="pay_excess_btn",
+                )
+
+        # Ticket status box
+        tok_stat = st.session_state.get("gate_token", "")
+        if tok_stat:
+            try:
+                t_status = journey.get_ticket_status(tok_stat)
+            except Exception:
+                t_status = None
+            if t_status:
+                with st.expander("📋 Ticket Status (from database)", expanded=True):
+                    st.write(
+                        f"**State:** `{t_status['state']}` "
+                        f"({ui_helpers.STATE_LABELS.get(t_status['state'], '')})"
+                    )
+                    st.write(
+                        f"**Route:** {t_status['source']} → {t_status['dest']}  |  "
+                        f"**Fare paid:** Rs {t_status['paid_fare']}"
+                    )
+                    st.write(f"**Entry time:** {t_status['entry_time']} min")
+                    st.write(f"**Pending amount:** Rs {t_status['pending_amount']}")
+                    hist_str = t_status["history"]
+                    st.write(f"**Symbols so far:** `{hist_str}`")
+                    st.button(
+                        "Send to String Tester",
+                        on_click=on_send_to_tester,
+                        key="gate_send_tester_btn",
+                    )
+
+    if st.session_state["scan_log"]:
+        st.divider()
+        st.subheader("Session Scan Log")
+        st.dataframe(st.session_state["scan_log"], use_container_width=True)
+
+# ===========================================================================
+# TAB 3 — STRING TESTER
+# ===========================================================================
+with tab_tester:
+    st.subheader("Pure Automata String Evaluation")
+
+    st.radio(
+        "Automaton:",
+        options=["Journey DFA", "Booking DFA"],
+        horizontal=True,
+        key="tester_dfa_kind",
+    )
+
+    tester_kind = st.session_state["tester_dfa_kind"]
+
+    # Quick example buttons — use on_click so they don't re-trigger on rerun
+    st.write("**Quick examples:**")
+    if tester_kind == "Journey DFA":
+        journey_exs = ["ED", "EX", "EOP", "ETP", "EOOP", "EO", "ET", "EE", "D", "EDR"]
+        ex_cols = st.columns(len(journey_exs))
+        for col, ex in zip(ex_cols, journey_exs):
+            col.button(
+                ex,
+                key=f"ex_{ex}",
+                on_click=_set_tester_seq,
+                args=(ex, "Journey DFA"),
+            )
+    else:
+        c1, c2 = st.columns(2)
+        c1.button(
+            "Valid+retry",
+            key="ex_b_valid",
+            on_click=_set_tester_seq,
+            args=("src dst confirm confirm pay_fail pay_ok gen", "Booking DFA"),
+        )
+        c2.button(
+            "Invalid skip",
+            key="ex_b_invalid",
+            on_click=_set_tester_seq,
+            args=("src confirm pay_ok gen", "Booking DFA"),
+        )
+
+    st.text_input("Symbol sequence:", key="tester_sequence")
+
     if st.button("Run", type="primary"):
-        symbols = parse_symbols(text, which)
-        accepted, trace = dfa.run(symbols)
-        show_trace(accepted, trace)
+        seq_text = st.session_state["tester_sequence"]
+        kind_key = "journey" if tester_kind == "Journey DFA" else "booking"
+        try:
+            symbols = ui_helpers.parse_sequence(seq_text, kind_key)
+            target_dfa = JOURNEY_DFA if tester_kind == "Journey DFA" else BOOKING_DFA
 
-        st.subheader("Second opinion: regular expression")
-        if which == "Journey DFA":
-            st.write(f"Regex: `{regex}`")
-            st.write(f"Regex says: **{'match' if ja.check_journey_regex(symbols) else 'no match'}**")
-        else:
-            st.write(f"Corrected regex: `{booking.BOOKING_REGEX_CORRECTED}`")
-            st.write(f"README regex (as written): `{booking.BOOKING_REGEX_AS_WRITTEN}`")
-            st.write(f"Corrected regex says: **{'match' if booking.check_booking_regex(symbols, corrected=True) else 'no match'}**")
-            st.write(f"As-written regex says: **{'match' if booking.check_booking_regex(symbols, corrected=False) else 'no match'}**")
-            if "cancel" in symbols:
-                st.info("The regex does not model `cancel`, so it may disagree with the DFA here.")
+            accepted, trace = target_dfa.run(symbols)
 
+            c_res, c_diag = st.columns([1, 1])
+            with c_res:
+                if accepted:
+                    st.success("## ✅ ACCEPTED")
+                else:
+                    st.error("## ❌ REJECTED")
 
-# ---------------------------------------------------------------------------
-# Screen 4: Automata viewer
-# ---------------------------------------------------------------------------
-def tab_tables() -> None:
-    st.subheader("Journey DFA")
-    st.table(ja.get_transition_table())
-    st.write(f"Regex: `{ja.JOURNEY_REGEX}`")
-    jd = ja.JOURNEY_DFA
-    st.graphviz_chart(dot_diagram(dfa_edges(jd), jd.start_state, jd.final_states, dead=jd.dead_state))
+                st.write(
+                    f"**Final state:** `{trace.final_state}` "
+                    f"({ui_helpers.STATE_LABELS.get(trace.final_state, '')})"
+                )
+                st.write(f"**Reason:** {trace.reason}")
 
-    st.subheader("Booking DFA")
-    st.table(booking.get_transition_table())
-    st.write(f"Regex (corrected, two `confirm`s): `{booking.BOOKING_REGEX_CORRECTED}`")
-    st.write(f"Regex (as written in the README): `{booking.BOOKING_REGEX_AS_WRITTEN}`")
-    st.warning("**Contract note (Issue A):** the README regex has one `confirm`, but the transition table "
-               "needs two (q2→q3 'Show Fare', q3→q4 'Proceed to Pay'). The table was kept as given; "
-               "the corrected regex fixes the mismatch.")
-    bd = booking.BOOKING_DFA
-    st.graphviz_chart(dot_diagram(dfa_edges(bd), bd.start_state, bd.final_states, dead=bd.dead_state))
+                # Regex check
+                if tester_kind == "Journey DFA":
+                    reg_ok = check_journey_regex(symbols)
+                    reg_expr = JOURNEY_REGEX
+                else:
+                    reg_ok = check_booking_regex(symbols, corrected=True)
+                    reg_expr = BOOKING_REGEX_CORRECTED
 
+                st.code(f"Regex: {reg_expr}", language="text")
+                st.write(f"**Regex verdict:** {'✅ Accepted' if reg_ok else '❌ Rejected'}")
 
-def tab_moore_mealy() -> None:
-    st.subheader("Moore machine (output depends on the state)")
-    st.table(ja.get_moore_table())
-    st.caption("The JE output is a template; Person 2 fills in the rupee amount.")
-    st.subheader("Mealy machine (output depends on state and input)")
-    st.table(ja.get_mealy_table())
-    st.caption("Only the six valid transitions come from the README. "
-               "Outputs for transitions into JT and for JE on O/T are additions (Issue B).")
+                unknowns = [s for s in symbols if s not in target_dfa.alphabet]
+                if unknowns:
+                    st.warning(f"Unknown symbols: {unknowns}")
+                elif accepted == reg_ok:
+                    st.success("🤝 DFA and regex **AGREE**.")
+                else:
+                    st.info("ℹ️ DFA and regex disagree on this trace (e.g. cancel paths not in regex).")
 
+                st.write("**Execution trace:**")
+                st.table(trace)
 
-def tab_nfa() -> None:
-    st.subheader("Payment-method NFA (theory demonstration only - the real kiosk accepts cash only)")
-    steps = booking.get_subset_steps()
-    nfa = booking.PAYMENT_NFA
-    st.graphviz_chart(dot_diagram(nfa_edges(nfa), nfa.start_state, nfa.final_states))
-    st.write("**NFA transition table**")
-    st.table(steps["nfa_transition_table"])
-    st.write("**Subset construction: which set of NFA states becomes which DFA state**")
-    st.table(steps["display_rows"])
-    st.write("Discovery order: " + " → ".join(steps["discovery_order"]))
-    dfa = steps["dfa"]
-    st.write("**Resulting DFA**")
-    st.graphviz_chart(dot_diagram(dfa_edges(dfa), dfa.start_state, dfa.final_states, dead=dfa.dead_state))
-    st.success("The NFA and the DFA accept exactly the same strings.")
+            with c_diag:
+                st.write("**State diagram (final state highlighted):**")
+                t_rows = (
+                    get_journey_transition_table()
+                    if tester_kind == "Journey DFA"
+                    else get_booking_transition_table()
+                )
+                try:
+                    dot = ui_helpers.build_dot(
+                        t_rows,
+                        current_state=trace.final_state,
+                        accepting=target_dfa.final_states,
+                        dead=target_dfa.dead_state,
+                    )
+                    st.graphviz_chart(dot)
+                except Exception as exc:
+                    st.error(f"Diagram error: {exc}")
 
+        except Exception as exc:
+            st.error(f"Error running sequence: {exc}")
 
-def tab_minimize() -> None:
-    st.subheader("DFA minimization (table-filling / Myhill-Nerode)")
-    st.write("A deliberately redundant Booking DFA has two Paid states, PaidCash and PaidUPI, that behave identically.")
-    if not st.button("Minimize", type="primary"):
-        return
-    m = booking.get_minimization_steps()
-    c1, c2 = st.columns(2)
-    c1.metric("States before", m["before_state_count"])
-    c2.metric("States after", m["after_state_count"])
-    st.caption(m["counting_rule"])
+# ===========================================================================
+# TAB 4 — AUTOMATA VIEWER
+# ===========================================================================
+with tab_viewer:
+    st.subheader("Formal Automata Theory")
 
-    before = booking.get_redundant_booking_dfa()
-    st.write("**Before (8 states)**")
-    st.graphviz_chart(dot_diagram(dfa_edges(before), before.start_state, before.final_states,
-                                  dead=before.dead_state))
+    v1, v2, v3, v4, v5 = st.tabs([
+        "Journey DFA",
+        "Booking DFA",
+        "Moore & Mealy",
+        "NFA → DFA",
+        "Minimization",
+    ])
 
-    st.write("**Marking history, round by round**")
-    st.table([{"Round": h["round"], "Pair": h["pair_str"], "Reason": h["reason"]}
-              for h in m["marking_history"]])
+    with v1:
+        st.markdown("### Journey Lifecycle DFA")
+        st.write("Models the full lifecycle of one metro ticket through gate scans.")
+        st.table(get_journey_transition_table())
+        st.code(f"Regex: {JOURNEY_REGEX}", language="text")
+        c_sl, c_sy = st.columns(2)
+        with c_sl:
+            st.write("**States:**")
+            for s in JOURNEY_DFA.states:
+                st.write(f"- `{s}` : {ui_helpers.STATE_LABELS.get(s, s)}")
+        with c_sy:
+            st.write("**Symbols:**")
+            for a in JOURNEY_DFA.alphabet:
+                st.write(f"- `{a}` : {ui_helpers.SYMBOL_MEANINGS.get(a, a)}")
+        try:
+            st.graphviz_chart(ui_helpers.build_dot(
+                get_journey_transition_table(),
+                accepting=JOURNEY_DFA.final_states,
+                dead=JOURNEY_DFA.dead_state,
+            ))
+        except Exception as exc:
+            st.error(str(exc))
 
-    st.write("**All pairs**")
-    st.table([{k: str(v) for k, v in row.items()} for row in m["display_table"]])
+    with v2:
+        st.markdown("### Kiosk Booking DFA")
+        st.write("Models the ticket purchase flow at a kiosk.")
+        st.table(get_booking_transition_table())
+        st.write("**As written in README (1 confirm):**")
+        st.code(BOOKING_REGEX_AS_WRITTEN, language="text")
+        st.write("**Corrected (2 confirms):**")
+        st.code(BOOKING_REGEX_CORRECTED, language="text")
+        st.info(
+            "The corrected regex requires two `confirm` symbols because the kiosk "
+            "has two distinct steps: showing the fare (q2→q3) and proceeding to pay (q3→q4)."
+        )
+        try:
+            st.graphviz_chart(ui_helpers.build_dot(
+                get_booking_transition_table(),
+                accepting=BOOKING_DFA.final_states,
+                dead=BOOKING_DFA.dead_state,
+            ))
+        except Exception as exc:
+            st.error(str(exc))
 
-    st.write(f"**Unmarked (equivalent) pairs:** {m['unmarked_pairs_str']}")
-    for note in m["merged_notes"]:
-        st.info(note)
+    with v3:
+        st.markdown("### Moore Machine vs Mealy Machine")
+        st.info(
+            "**Moore:** output depends only on the *state entered* — same output "
+            "regardless of which symbol caused the transition.  "
+            "**Mealy:** output depends on the *transition taken* (state + symbol)."
+        )
+        m1, m2 = st.columns(2)
+        m1.markdown("#### Moore (state output)")
+        m1.table(get_moore_table())
+        m2.markdown("#### Mealy (transition output)")
+        m2.table(get_mealy_table())
 
-    after = m["minimized_dfa"]
-    st.write("**After (7 states)**")
-    st.table(after.get_transition_table())
-    st.graphviz_chart(dot_diagram(dfa_edges(after), after.start_state, after.final_states,
-                                  dead=after.dead_state))
-    st.success("The minimized DFA and the original accept exactly the same strings.")
+    with v4:
+        st.markdown("### Payment NFA → DFA (Subset Construction)")
+        st.info(
+            "This NFA models non-deterministic payment method choice "
+            "(UPI / card / cash branches via ε-transitions). "
+            "The physical kiosk accepts **cash only**; this is a theory demo."
+        )
+        try:
+            subset_data = get_subset_steps()
+            st.markdown("#### Payment NFA transition table")
+            st.table(subset_data["nfa_transition_table"])
+            st.markdown("#### Subset construction table")
+            st.table(subset_data["display_rows"])
+            st.markdown("#### DFA state → NFA subset")
+            st.json(subset_data["name_to_subset"])
+        except Exception as exc:
+            st.error(str(exc))
 
+    with v5:
+        st.markdown("### DFA Minimization (Myhill-Nerode Table-Filling)")
+        st.write(
+            "The redundant 8-state Booking DFA has two equivalent states "
+            "(`PaidCash` and `PaidUPI`) that merge into one, giving a 7-state minimal DFA."
+        )
+        if st.button("Run Table-Filling Minimization", key="btn_minimize"):
+            try:
+                min_data = get_minimization_steps()
+                st.success(
+                    f"Reduced from **{min_data['before_state_count']}** to "
+                    f"**{min_data['after_state_count']}** states."
+                )
+                st.caption(min_data["counting_rule"])
 
-def screen_viewer() -> None:
-    st.header("📚 Automata viewer (the theory)")
-    t1, t2, t3, t4 = st.tabs(["Tables & regexes", "Moore & Mealy", "NFA → DFA", "Minimization"])
-    with t1:
-        tab_tables()
-    with t2:
-        tab_moore_mealy()
-    with t3:
-        tab_nfa()
-    with t4:
-        tab_minimize()
+                st.markdown("#### Distinguishability table")
+                st.dataframe(min_data["display_table"], use_container_width=True)
 
+                st.markdown("#### Equivalent pairs & merges")
+                st.write(f"Unmarked pairs: `{min_data['unmarked_pairs_str']}`")
+                for note in min_data["merged_notes"]:
+                    st.info(note)
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-st.sidebar.title("🚇 Metro Automata")
-page = st.sidebar.radio("Screen", ["Kiosk", "Gate simulator", "String tester", "Automata viewer"])
-st.sidebar.caption(f"{config.NUM_STATIONS} stations, one-way circular line. "
-                   f"Time limit {config.TIME_LIMIT:g} min.")
-
-if page == "Kiosk":
-    screen_kiosk()
-elif page == "Gate simulator":
-    screen_gate()
-elif page == "String tester":
-    screen_tester()
-else:
-    screen_viewer()
+                st.markdown("#### Minimized DFA")
+                st.table(min_data["minimized_dfa"].get_transition_table())
+            except Exception as exc:
+                st.error(str(exc))
