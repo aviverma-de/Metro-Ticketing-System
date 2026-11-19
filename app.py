@@ -504,21 +504,6 @@ with tab_gate:
             )
             st.info(scan_res["message"])
 
-            c_mo, c_me = st.columns(2)
-            c_mo.markdown(
-                "<div style='background:#e8f4f8;color:#17202a;padding:10px;border-radius:5px;"
-                "border-left:4px solid #0288d1'>"
-                f"<b>Moore:</b><br>{scan_res['moore_output']}</div>",
-                unsafe_allow_html=True,
-            )
-
-            c_me.markdown(
-                "<div style='background:#f3e5f5;color:#17202a;padding:10px;border-radius:5px;"
-                "border-left:4px solid #7b1fa2'>"
-                f"<b>Mealy:</b><br>{scan_res['mealy_output']}</div>",
-                unsafe_allow_html=True,
-            )
-
             # Pay button when JE
             if scan_res.get("new_state") == "JE":
                 amount = scan_res.get("amount", 0)
