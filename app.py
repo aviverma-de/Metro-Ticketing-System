@@ -20,16 +20,12 @@ from booking import (
     BOOKING_REGEX_CORRECTED,
     check_booking_regex,
     get_transition_table as get_booking_transition_table,
-    get_subset_steps,
-    get_minimization_steps,
 )
 from journey_automata import (
     JOURNEY_DFA,
     JOURNEY_REGEX,
     check_journey_regex,
     get_transition_table as get_journey_transition_table,
-    get_moore_table,
-    get_mealy_table,
 )
 import ui_helpers
 
@@ -690,12 +686,9 @@ with tab_tester:
 with tab_viewer:
     st.subheader("Formal Automata Theory")
 
-    v1, v2, v3, v4, v5 = st.tabs([
+    v1, v2 = st.tabs([
         "Journey DFA",
         "Booking DFA",
-        "Moore & Mealy",
-        "NFA → DFA",
-        "Minimization",
     ])
 
     with v1:
@@ -741,62 +734,3 @@ with tab_viewer:
             ))
         except Exception as exc:
             st.error(str(exc))
-
-    with v3:
-        st.markdown("### Moore Machine vs Mealy Machine")
-        st.info(
-            "**Moore:** output depends only on the *state entered* — same output "
-            "regardless of which symbol caused the transition.  "
-            "**Mealy:** output depends on the *transition taken* (state + symbol)."
-        )
-        m1, m2 = st.columns(2)
-        m1.markdown("#### Moore (state output)")
-        m1.table(get_moore_table())
-        m2.markdown("#### Mealy (transition output)")
-        m2.table(get_mealy_table())
-
-    with v4:
-        st.markdown("### Payment NFA → DFA (Subset Construction)")
-        st.info(
-            "This NFA models non-deterministic payment method choice "
-            "(UPI / card / cash branches via ε-transitions). "
-            "The physical kiosk accepts **cash only**; this is a theory demo."
-        )
-        try:
-            subset_data = get_subset_steps()
-            st.markdown("#### Payment NFA transition table")
-            st.table(subset_data["nfa_transition_table"])
-            st.markdown("#### Subset construction table")
-            st.table(subset_data["display_rows"])
-            st.markdown("#### DFA state → NFA subset")
-            st.json(subset_data["name_to_subset"])
-        except Exception as exc:
-            st.error(str(exc))
-
-    with v5:
-        st.markdown("### DFA Minimization (Myhill-Nerode Table-Filling)")
-        st.write(
-            "The redundant 8-state Booking DFA has two equivalent states "
-            "(`PaidCash` and `PaidUPI`) that merge into one, giving a 7-state minimal DFA."
-        )
-        if st.button("Run Table-Filling Minimization", key="btn_minimize"):
-            try:
-                min_data = get_minimization_steps()
-                st.success(
-                    f"Reduced from **{min_data['before_state_count']}** to "
-                    f"**{min_data['after_state_count']}** states."
-                )
-                st.caption(min_data["counting_rule"])
-
-                st.markdown("#### Distinguishability table")
-                st.dataframe(min_data["display_table"], use_container_width=True)
-
-                st.markdown("#### Equivalent pairs & merges")
-                st.write(f"Unmarked pairs: `{min_data['unmarked_pairs_str']}`")
-                for note in min_data["merged_notes"]:
-                    st.info(note)
-
-                st.markdown("#### Minimized DFA")
-                st.table(min_data["minimized_dfa"].get_transition_table())
-            except Exception as exc:
-                st.error(str(exc))
