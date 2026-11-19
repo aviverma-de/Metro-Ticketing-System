@@ -10,7 +10,7 @@ pay_excess() handles the payment step for excess-fare / over-time charges.
 get_ticket_status() exposes the ticket record for the UI.
 """
 
-from journey_automata import step, get_moore_output, get_mealy_output, JOURNEY_DFA
+from journey_automata import step
 from token_utils import verify_token
 from stations import distance, fare_for_distance, excess_fare
 import config
@@ -89,8 +89,7 @@ def process_scan(token: str, station: int, gate_type: str, now: float) -> dict:
     Process a gate scan: classify, step the DFA, update the record.
 
     Returns a dict with keys:
-      symbol, old_state, new_state, gate, amount, message,
-      moore_output, mealy_output, valid
+      symbol, old_state, new_state, gate, amount, message, valid
     """
     # Classify
     symbol = classify(token, station, gate_type, now)
@@ -110,17 +109,14 @@ def process_scan(token: str, station: int, gate_type: str, now: float) -> dict:
             "gate": "LOCKED",
             "amount": 0,
             "message": "Invalid ticket or wrong use. Gate locked.",
-            "moore_output": get_moore_output("JT"),
-            "mealy_output": "Lock gate, alarm",
             "valid": False,
         }
 
     old_state = ticket["state"]
     new_state = step(old_state, symbol)
 
-    # Determine gate from Mealy output
-    mealy_out = get_mealy_output(old_state, symbol)
-    gate = "OPEN" if mealy_out.startswith("Open") else "LOCKED"
+    # Gate opens on valid entry (J1), normal exit (J2), or early exit (J3)
+    gate = "OPEN" if new_state in ("J1", "J2", "J3") else "LOCKED"
 
     # Compute amount
     amount = 0
@@ -144,17 +140,6 @@ def process_scan(token: str, station: int, gate_type: str, now: float) -> dict:
     record.update_ticket(fields["txn_id"], **update_fields)
     record.append_history(fields["txn_id"], symbol)
 
-    # Moore output — for JE, replace the template with the real amount
-    moore_out = get_moore_output(new_state)
-    if new_state == "JE":
-        if symbol == "O":
-            moore_out = f"Gate LOCKED, show Pay excess Rs {amount}"
-        elif symbol == "T":
-            moore_out = f"Gate LOCKED, show Pay over-time charge Rs {amount}"
-        else:
-            # Fallback for O/T self-loops
-            moore_out = f"Gate LOCKED, show Pay Rs {amount}"
-
     # Message by symbol
     messages = {
         "E": "Entry accepted. Gate open.",
@@ -174,8 +159,6 @@ def process_scan(token: str, station: int, gate_type: str, now: float) -> dict:
         "gate": gate,
         "amount": amount,
         "message": message,
-        "moore_output": moore_out,
-        "mealy_output": mealy_out,
         "valid": True,
     }
 
@@ -196,8 +179,6 @@ def pay_excess(token: str) -> dict:
             "gate": "LOCKED",
             "amount": 0,
             "message": "No charge pending",
-            "moore_output": "",
-            "mealy_output": "",
             "valid": False,
         }
 
@@ -210,8 +191,6 @@ def pay_excess(token: str) -> dict:
             "gate": "LOCKED",
             "amount": 0,
             "message": "No charge pending",
-            "moore_output": "",
-            "mealy_output": "",
             "valid": False,
         }
 
@@ -225,18 +204,13 @@ def pay_excess(token: str) -> dict:
             "gate": "LOCKED",
             "amount": 0,
             "message": "No charge pending",
-            "moore_output": get_moore_output(old_state),
-            "mealy_output": "",
             "valid": True,
         }
 
     # Feed "P" into the DFA
     new_state = step("JE", "P")  # -> J2
     amount = ticket["pending_amount"]
-
-    # Mealy output
-    mealy_out = get_mealy_output("JE", "P")
-    gate = "OPEN" if mealy_out.startswith("Open") else "LOCKED"
+    gate = "OPEN" if new_state in ("J1", "J2", "J3") else "LOCKED"
 
     # Update record
     record.update_ticket(fields["txn_id"], state=new_state, pending_amount=0)
@@ -249,8 +223,6 @@ def pay_excess(token: str) -> dict:
         "gate": gate,
         "amount": amount,
         "message": "Charge paid. Exit gate open.",
-        "moore_output": get_moore_output(new_state),
-        "mealy_output": mealy_out,
         "valid": True,
     }
 

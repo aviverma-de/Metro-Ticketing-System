@@ -1,7 +1,7 @@
 """
 Journey Automata Definitions (Contract Core)
 --------------------------------------------
-Implements the Journey DFA, Moore Machine, and Mealy Machine strictly
+Implements the Journey DFA and regular expression validation strictly
 according to the shared contract.
 
 Module Choice Rationale:
@@ -15,8 +15,8 @@ without circular dependencies or coupling to kiosk or UI code.
 """
 
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
-from automata import DFA, MooreMachine, MealyMachine, TraceList
+from typing import Dict, List, Tuple, Union
+from automata import DFA, TraceList
 
 # ---------------------------------------------------------------------------
 # 1. State and Symbol Definitions (Frozen Contract)
@@ -102,70 +102,7 @@ def check_journey_regex(sequence: Union[str, List[str]]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 4. Moore Machine (State-Dependent Gate Outputs)
-# ---------------------------------------------------------------------------
-
-# Note on JE output (Issue C):
-# Returns the template text. The dynamic rupee amount is filled in by Person 2.
-JOURNEY_MOORE_OUTPUTS: Dict[str, str] = {
-    "J0": "Ticket ready",
-    "J1": "Entry gate open",
-    "JE": "Gate LOCKED, show Pay excess ₹ or Pay over-time charge ₹",
-    "J2": "Exit gate open, Thank you",
-    "J3": "Exit gate open, Early exit recorded",
-    "JT": "Gate LOCKED, alarm",
-}
-
-JOURNEY_MOORE = MooreMachine(
-    states=JOURNEY_STATES,
-    alphabet=JOURNEY_ALPHABET,
-    transitions=JOURNEY_TRANSITIONS,
-    start_state=JOURNEY_START_STATE,
-    output_table=JOURNEY_MOORE_OUTPUTS,
-    dead_state=JOURNEY_DEAD_STATE,
-    default_output="Gate LOCKED, alarm",
-)
-
-# ---------------------------------------------------------------------------
-# 5. Mealy Machine (Transition-Dependent Gate Outputs)
-# ---------------------------------------------------------------------------
-
-# Primary contract transitions from README
-JOURNEY_MEALY_OUTPUTS: Dict[Tuple[str, str], str] = {
-    ("J0", "E"): "Open entry gate, record entry time",
-    ("J1", "D"): "Open exit gate",
-    ("J1", "X"): "Open exit gate, record early exit",
-    ("J1", "O"): "Lock gate, show excess fare",
-    ("J1", "T"): "Lock gate, show over-time charge",
-    ("JE", "P"): "Open exit gate",
-}
-
-# Additions beyond README (Issue B handling):
-# Sensible defaults for all remaining transitions in the matrix:
-# 1. Repeated scans while charge is pending:
-JOURNEY_MEALY_OUTPUTS[("JE", "O")] = "Gate stays locked, charge still pending"
-JOURNEY_MEALY_OUTPUTS[("JE", "T")] = "Gate stays locked, charge still pending"
-
-# 2. Any transition leading into the trap state JT outputs alarm:
-for (st, sym), nxt in JOURNEY_TRANSITIONS.items():
-    if (st, sym) not in JOURNEY_MEALY_OUTPUTS:
-        if nxt == "JT":
-            JOURNEY_MEALY_OUTPUTS[(st, sym)] = "Lock gate, alarm"
-        else:
-            JOURNEY_MEALY_OUTPUTS[(st, sym)] = "Lock gate, alarm"
-
-JOURNEY_MEALY = MealyMachine(
-    states=JOURNEY_STATES,
-    alphabet=JOURNEY_ALPHABET,
-    transitions=JOURNEY_TRANSITIONS,
-    start_state=JOURNEY_START_STATE,
-    output_table=JOURNEY_MEALY_OUTPUTS,
-    dead_state=JOURNEY_DEAD_STATE,
-    default_output="Lock gate, alarm",
-)
-
-# ---------------------------------------------------------------------------
-# 6. Public Convenience Functions for Person 2 and Person 3
+# 4. Public Convenience Functions for Person 2 and Person 3
 # ---------------------------------------------------------------------------
 
 
@@ -187,37 +124,6 @@ def get_transition_table() -> List[Dict[str, str]]:
     return JOURNEY_DFA.get_transition_table()
 
 
-def get_moore_table() -> List[Dict[str, str]]:
-    """Returns the Journey Moore machine table as plain rows for Streamlit."""
-    return JOURNEY_MOORE.get_table()
-
-
-def get_mealy_table() -> List[Dict[str, str]]:
-    """Returns the Journey Mealy machine table as plain rows for Streamlit."""
-    return JOURNEY_MEALY.get_table()
-
-
-def get_moore_output(state: str) -> str:
-    """Returns the Moore output for a given state."""
-    return JOURNEY_MOORE.get_output(state)
-
-
-def get_mealy_output(state: str, symbol: str) -> str:
-    """Returns the Mealy output for a given transition (state, symbol)."""
-    return JOURNEY_MEALY.get_output(state, symbol)
-
-
 def get_journey_dfa() -> DFA:
     """Returns the pre-configured Journey DFA instance."""
     return JOURNEY_DFA
-
-
-def get_journey_moore() -> MooreMachine:
-    """Returns the pre-configured Journey Moore machine instance."""
-    return JOURNEY_MOORE
-
-
-def get_journey_mealy() -> MealyMachine:
-    """Returns the pre-configured Journey Mealy machine instance."""
-    return JOURNEY_MEALY
-
