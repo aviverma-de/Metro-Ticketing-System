@@ -73,10 +73,7 @@ BOOKING_DFA = DFA(
 # 2. Regular Expressions (Issue A Handling)
 # ---------------------------------------------------------------------------
 
-# As written in the README (Notice: contains only one confirm)
-BOOKING_REGEX_AS_WRITTEN: str = "src (src | dst)* dst confirm pay_fail* pay_ok gen"
-
-# Corrected regex matching the DFA table (q2 -> confirm -> q3 -> confirm -> q4)
+#Regex matching the DFA table (q2 -> confirm -> q3 -> confirm -> q4)
 BOOKING_REGEX_CORRECTED: str = "src (src | dst)* dst confirm confirm pay_fail* pay_ok gen"
 
 # Compiled token matchers (sequences excluding cancel)
